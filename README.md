@@ -4,7 +4,7 @@ Wi-Fi site-survey and heatmapping tool. Load a floor plan, calibrate the scale, 
 space clicking survey points, and get signal / SNR / throughput / per-AP heatmaps plus
 coverage, dead-zone, interference and channel-planning analysis.
 
-Status: core engine done and tested; GUI in progress.
+Status: core engine done and tested; first GUI working (survey, heatmaps, analysis). Builds for Linux and Windows.
 
 ## Engine (`src/`)
 
@@ -14,10 +14,23 @@ Status: core engine done and tested; GUI in progress.
 | `calibration` | Two-point pixels-per-meter calibration |
 | `heatmap` | IDW interpolation with a distance cutoff; signal, SNR, throughput and per-AP views; color ramps |
 | `analysis` | Coverage %, dead zones, per-AP summaries, co/adjacent-channel interference, channel suggestions |
-| `scanner` | `Scanner` trait with `netsh` (Windows), `nmcli` (Linux) and mock backends |
+| `scanner` | `Scanner` trait with `iw` and `nmcli` (Linux), `netsh` (Windows) and mock backends |
 | `iperf` | Builds and parses `iperf3 -J` runs (TCP and UDP) |
 
-## Try it
+## GUI (`src/app.rs`)
+
+egui app: open a floor plan image (PNG/JPEG) or use the blank canvas, calibrate the scale by
+clicking two points, then click the plan to survey. Heatmap views: signal, SNR, throughput,
+per-AP. Side panel shows coverage vs. target, dead zones, interference, channel suggestions
+and an editable AP table. Projects save as JSON; survey data exports to CSV. The simulated
+scanner lets you try everything without hardware.
+
+```sh
+cargo run --release                      # GUI
+cargo build --release --target x86_64-pc-windows-gnu   # Windows .exe (needs mingw-w64)
+```
+
+## Engine checks
 
 ```sh
 cargo test

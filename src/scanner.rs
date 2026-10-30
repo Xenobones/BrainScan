@@ -17,7 +17,13 @@ pub fn default_scanner() -> Box<dyn Scanner + Send> {
     }
     #[cfg(not(windows))]
     {
-        Box::new(NmcliScanner)
+        // `iw` reports exact dBm and works on iwd-based distros (e.g. Omarchy) where
+        // NetworkManager/nmcli may not be installed.
+        if Command::new("iw").arg("--version").output().is_ok() {
+            Box::new(IwScanner::default())
+        } else {
+            Box::new(NmcliScanner)
+        }
     }
 }
 
@@ -74,6 +80,97 @@ pub fn parse_nmcli(output: &str) -> Result<Vec<ApReading>> {
             channel,
             band: Band::from_freq_mhz(freq).unwrap_or_else(|| Band::guess_from_channel(channel)),
         });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- Linux: iw
+
+/// Uses `iw dev <if> scan` (exact dBm; needs root or CAP_NET_ADMIN to trigger a fresh
+/// scan) and falls back to `scan dump`, the kernel's cached results, which any user can read.
+#[derive(Default)]
+pub struct IwScanner {
+    /// Wi-Fi interface name; auto-detected from `iw dev` when `None`.
+    pub interface: Option<String>,
+}
+
+impl Scanner for IwScanner {
+    fn scan(&mut self, _: Option<(f64, f64)>) -> Result<Vec<ApReading>> {
+        let iface = match &self.interface {
+            Some(i) => i.clone(),
+            None => {
+                let i = parse_iw_interface(&run("iw", &["dev"])?)
+                    .ok_or_else(|| Error::Command("no Wi-Fi interface found in `iw dev`".into()))?;
+                self.interface = Some(i.clone());
+                i
+            }
+        };
+        let out = run("iw", &["dev", &iface, "scan"]).or_else(|_| run("iw", &["dev", &iface, "scan", "dump"]))?;
+        parse_iw(&out)
+    }
+}
+
+pub fn parse_iw_interface(output: &str) -> Option<String> {
+    output.lines().find_map(|l| l.trim().strip_prefix("Interface ").map(|s| s.trim().to_string()))
+}
+
+/// Channel number for a center frequency in MHz.
+pub fn freq_to_channel(mhz: u32) -> Option<u16> {
+    match mhz {
+        2412..=2472 => Some(((mhz - 2407) / 5) as u16),
+        2484 => Some(14),
+        5150..=5924 => Some(((mhz - 5000) / 5) as u16),
+        5955..=7115 => Some(((mhz - 5950) / 5) as u16),
+        _ => None,
+    }
+}
+
+/// Parses `iw dev <if> scan` / `scan dump` output.
+pub fn parse_iw(output: &str) -> Result<Vec<ApReading>> {
+    #[derive(Default)]
+    struct Cur {
+        bssid: String,
+        freq: Option<u32>,
+        signal: Option<f64>,
+        ssid: String,
+    }
+    fn flush(cur: Option<Cur>, out: &mut Vec<ApReading>) {
+        if let Some(c) = cur {
+            if let (Some(f), Some(sig)) = (c.freq, c.signal) {
+                if let (Some(ch), Some(band)) = (freq_to_channel(f), Band::from_freq_mhz(f)) {
+                    out.push(ApReading {
+                        bssid: normalize_bssid(&c.bssid),
+                        ssid: c.ssid,
+                        rssi_dbm: sig.round() as i32,
+                        channel: ch,
+                        band,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur: Option<Cur> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("BSS ") {
+            flush(cur.take(), &mut out);
+            let bssid: String = rest.chars().take_while(|c| c.is_ascii_hexdigit() || *c == ':').collect();
+            cur = Some(Cur { bssid, ..Default::default() });
+        } else if let Some(c) = cur.as_mut() {
+            let l = line.trim();
+            if let Some(v) = l.strip_prefix("freq:") {
+                c.freq = v.trim().split('.').next().and_then(|n| n.parse().ok());
+            } else if let Some(v) = l.strip_prefix("signal:") {
+                c.signal = v.split_whitespace().next().and_then(|n| n.parse().ok());
+            } else if let Some(v) = l.strip_prefix("SSID:") {
+                c.ssid = v.trim().to_string();
+            }
+        }
+    }
+    flush(cur, &mut out);
+    if out.is_empty() && output.contains("BSS ") {
+        return Err(Error::Parse("iw output had BSS entries but none were usable".into()));
     }
     Ok(out)
 }
@@ -264,6 +361,34 @@ mod tests {
         assert_eq!(percent_to_dbm(0), -100);
         assert_eq!(percent_to_dbm(80), -60);
         assert_eq!(percent_to_dbm(250), -50);
+    }
+
+    const IW: &str = "\
+BSS aa:bb:cc:dd:ee:01(on wlan0) -- associated
+\tlast seen: 12.3s [boottime]
+\tfreq: 5180.0
+\tsignal: -52.00 dBm
+\tSSID: Corp
+BSS aa:bb:cc:dd:ee:02(on wlan0)
+\tfreq: 2437
+\tsignal: -71.50 dBm
+\tSSID:
+BSS aa:bb:cc:dd:ee:03(on wlan0)
+\tfreq: 6115
+\tsignal: -80.00 dBm
+\tSSID: Six
+";
+
+    #[test]
+    fn parses_iw_exact_dbm_and_channels() {
+        let r = parse_iw(IW).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!((r[0].rssi_dbm, r[0].channel, r[0].band), (-52, 36, Band::Ghz5));
+        assert_eq!((r[1].rssi_dbm, r[1].channel, r[1].ssid.as_str()), (-72, 6, ""));
+        assert_eq!((r[2].channel, r[2].band), (33, Band::Ghz6));
+        assert_eq!(parse_iw("").unwrap().len(), 0);
+        assert_eq!(parse_iw_interface("phy#0\n\tInterface wlan0\n\t\tifindex 3"), Some("wlan0".into()));
+        assert_eq!(freq_to_channel(2484), Some(14));
     }
 
     #[test]
