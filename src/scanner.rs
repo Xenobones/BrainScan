@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use crate::model::{normalize_bssid, ApReading, Band};
+use crate::walls::{path_loss_db, Wall};
 use crate::{Error, Result};
 
 /// A source of Wi-Fi readings. `position_m` is the surveyor's position in meters on the
@@ -293,12 +294,15 @@ pub struct MockScanner {
     pub shadow_sigma_db: f64,
     /// Weakest signal the "adapter" can still report.
     pub sensitivity_dbm: f64,
+    /// Walls in the same coordinate system as the APs (meters). Each wall with a material
+    /// that the AP-to-listener path crosses subtracts its attenuation.
+    pub walls: Vec<Wall>,
     seed: u64,
 }
 
 impl MockScanner {
     pub fn new(aps: Vec<MockAp>, seed: u64) -> MockScanner {
-        MockScanner { aps, path_loss_exponent: 3.0, shadow_sigma_db: 2.0, sensitivity_dbm: -92.0, seed }
+        MockScanner { aps, path_loss_exponent: 3.0, shadow_sigma_db: 2.0, sensitivity_dbm: -92.0, walls: Vec::new(), seed }
     }
 
     /// Reference loss at 1 m: free space, 2.4 GHz ~40 dB, 5 GHz ~47 dB, 6 GHz ~49 dB.
@@ -327,6 +331,7 @@ impl MockScanner {
         let d = ((ap.x_m - x).powi(2) + (ap.y_m - y).powi(2)).sqrt().max(1.0);
         ap.tx_dbm - Self::pl0(ap.band) - 10.0 * self.path_loss_exponent * d.log10()
             + self.shadow(x, y, ap_index) * self.shadow_sigma_db
+            - path_loss_db(&self.walls, (ap.x_m, ap.y_m), (x, y), ap.band)
     }
 }
 
@@ -508,6 +513,17 @@ SSID 2 :
         assert_eq!(m.scan(Some((10.0, 0.0))).unwrap()[0].rssi_dbm, mid);
         // 5 GHz at 1 m: 20 - 47 = -27 dBm ± shadowing
         assert!((m.rssi_at(0, 1.0, 0.0) + 27.0).abs() <= 2.0);
+    }
+
+    #[test]
+    fn mock_walls_attenuate_by_material() {
+        use crate::walls::Material;
+        let mut m = MockScanner::new(vec![ap("aa:00:00:00:00:01", 0.0, 0.0, 36, Band::Ghz5)], 7);
+        let open = m.rssi_at(0, 10.0, 0.0);
+        m.walls.push(Wall { id: 1, x1: 5.0, y1: -9.0, x2: 5.0, y2: 9.0, thickness_px: 1.0, material: Some(Material::Concrete) });
+        assert!((open - m.rssi_at(0, 10.0, 0.0) - 18.0).abs() < 1e-9);
+        // a listener on the near side of the wall is unaffected
+        assert_eq!(m.rssi_at(0, 3.0, 0.0), MockScanner::new(m.aps.clone(), 7).rssi_at(0, 3.0, 0.0));
     }
 
     #[test]

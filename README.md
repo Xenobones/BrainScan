@@ -15,6 +15,7 @@ Status: core engine done and tested; first GUI working (survey, heatmaps, analys
 | `heatmap` | IDW interpolation with a distance cutoff; signal, SNR, throughput and per-AP views; color ramps |
 | `analysis` | Coverage %, dead zones, per-AP summaries, co/adjacent-channel interference, channel suggestions |
 | `scanner` | `Scanner` trait with `iw` and `nmcli` (Linux), `netsh` (Windows) and mock backends |
+| `walls` | Wall model, material attenuation table, floor-plan wall detection and grouping |
 | `iperf` | Builds and parses `iperf3 -J` runs (TCP and UDP) |
 
 ## GUI (`src/app.rs`)
@@ -30,6 +31,12 @@ cargo run --release                      # GUI
 cargo build --release --target x86_64-pc-windows-gnu   # Windows .exe (needs mingw-w64)
 ```
 
+Walls: Walls menu > Detect walls finds long horizontal/vertical strokes in the plan image, groups
+them (exterior / thick / thin interior) and asks what each group is made of. Fix individual walls
+with the Select walls tool, add missed ones (diagonals aren't detected) with Draw wall. Materials
+carry typical attenuation figures (rough rules of thumb). Measured survey data is never altered by
+walls; they drive the simulated scanner and, later, prediction.
+
 ## Engine checks
 
 ```sh
@@ -39,7 +46,7 @@ cargo run --example demo -- /some/output/dir   # simulated office survey -> PNG 
 
 ## Roadmap
 
-1. egui GUI (floor plan import, click-to-survey, heatmap overlay, AP table)
+1. Predictive AP placement using the wall/material model
 2. Exact-dBm scanning (`iw` on Linux, native WLAN API on Windows)
 3. PDF reports and predictive AP placement
 4. Optional packet-level features on supported adapters

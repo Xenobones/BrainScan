@@ -11,12 +11,46 @@ use brainscan::heatmap::{self, Grid, IdwParams, Metric, Ramp};
 use brainscan::iperf::{self, IperfOptions};
 use brainscan::model::{ApReading, Band, FloorPlan, Project, Throughput, Units};
 use brainscan::scanner::{default_scanner, MockAp, MockScanner, Scanner};
+use brainscan::walls::{self, DetectOptions, Material, Wall, WallGroup};
 use eframe::egui::{self, Color32, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
     Survey,
     Calibrate,
+    Walls,
+    DrawWall,
+}
+
+/// One row of the "what are these walls made of?" dialog.
+struct GroupRow {
+    group: WallGroup,
+    ids: Vec<u32>,
+    material: Option<Material>,
+}
+
+fn wall_color(m: Option<Material>) -> Color32 {
+    match m {
+        None => Color32::from_rgb(235, 150, 0),
+        Some(Material::Drywall) => Color32::from_rgb(130, 130, 130),
+        Some(Material::Wood) => Color32::from_rgb(160, 110, 60),
+        Some(Material::Glass) => Color32::from_rgb(60, 170, 220),
+        Some(Material::Brick) => Color32::from_rgb(190, 80, 60),
+        Some(Material::CinderBlock) => Color32::from_rgb(150, 110, 120),
+        Some(Material::Concrete) => Color32::from_rgb(70, 70, 80),
+        Some(Material::ReinforcedConcrete) => Color32::from_rgb(30, 30, 70),
+        Some(Material::Metal) => Color32::from_rgb(190, 0, 190),
+    }
+}
+
+fn material_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, value: &mut Option<Material>) {
+    let text = value.map_or("Unassigned", |m| m.label());
+    egui::ComboBox::from_id_salt(salt).selected_text(text).show_ui(ui, |ui| {
+        ui.selectable_value(value, None, "Unassigned");
+        for m in Material::ALL {
+            ui.selectable_value(value, Some(m), m.label());
+        }
+    });
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -57,6 +91,12 @@ pub struct App {
     opacity: f32,
     show_points: bool,
     show_zones: bool,
+    show_walls: bool,
+    selected_wall: Option<u32>,
+    draw_start: Option<(f64, f64)>,
+    last_material: Material,
+    wall_dialog: Option<Vec<GroupRow>>,
+    hover_group: Option<usize>,
     target_dbm: f64,
 
     heat_dirty: bool,
@@ -97,6 +137,12 @@ impl App {
             opacity: 0.85,
             show_points: true,
             show_zones: true,
+            show_walls: true,
+            selected_wall: None,
+            draw_start: None,
+            last_material: Material::Drywall,
+            wall_dialog: None,
+            hover_group: None,
             target_dbm: DEFAULT_TARGET_DBM,
             heat_dirty: true,
             heat_grid: None,
@@ -256,6 +302,89 @@ impl App {
         };
     }
 
+    // ------------------------------------------------------------------- walls
+
+    fn detect_walls(&mut self) {
+        let path = self.project.floor_plan.as_ref().map(|f| f.image_path.clone()).unwrap_or_default();
+        if path.is_empty() {
+            self.status = "Wall detection needs a floor plan image (File > Open floor plan image).".into();
+            return;
+        }
+        let img = match image::open(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = format!("Could not read {path}: {e}");
+                return;
+            }
+        };
+        let w = img.width();
+        let gray = if w.max(img.height()) > 3000 {
+            img.resize(3000, 3000, image::imageops::FilterType::Triangle).to_luma8()
+        } else {
+            img.to_luma8()
+        };
+        let (gw, gh) = (gray.width() as usize, gray.height() as usize);
+        let factor = w as f64 / gw as f64;
+        let found: Vec<Wall> =
+            walls::detect_walls(gray.as_raw(), gw, gh, &DetectOptions::for_size(gw, gh)).iter().map(|x| x.scaled(factor)).collect();
+        if found.is_empty() {
+            self.status = "No walls found. Try the Draw wall tool, or a higher-contrast plan image.".into();
+            return;
+        }
+        self.status = format!("Found {} walls. Confirm their materials; click any wall with the Walls tool to fix it individually.", found.len());
+        self.project.walls = found;
+        self.selected_wall = None;
+        self.open_group_dialog();
+    }
+
+    fn open_group_dialog(&mut self) {
+        let rows: Vec<GroupRow> = walls::group_walls(&self.project.walls)
+            .into_iter()
+            .map(|(group, ids)| {
+                let current = self.project.walls.iter().find(|w| ids.contains(&w.id)).and_then(|w| w.material);
+                GroupRow { group, ids, material: current.or(Some(group.suggested_material())) }
+            })
+            .collect();
+        self.wall_dialog = (!rows.is_empty()).then_some(rows);
+    }
+
+    fn wall_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut rows) = self.wall_dialog.take() else { return };
+        let (mut apply, mut skip, mut hover) = (false, false, None);
+        egui::Window::new("What are these walls made of?").collapsible(false).resizable(false).default_pos([30.0, 110.0]).show(ctx, |ui| {
+            ui.label("Point at a row to highlight those walls on the plan.");
+            ui.add_space(4.0);
+            for (i, row) in rows.iter_mut().enumerate() {
+                let r = ui.horizontal(|ui| {
+                    ui.label(format!("{} ({})", row.group.label(), row.ids.len()));
+                    material_combo(ui, ("group", i), &mut row.material);
+                });
+                if r.response.hovered() {
+                    hover = Some(i);
+                }
+            }
+            ui.weak("Starting choices are guesses; change them to match the building.");
+            ui.horizontal(|ui| {
+                apply = ui.button("Apply").clicked();
+                skip = ui.button("Leave unassigned").clicked();
+            });
+        });
+        if apply {
+            for row in &rows {
+                for wall in self.project.walls.iter_mut().filter(|w| row.ids.contains(&w.id)) {
+                    wall.material = row.material;
+                }
+            }
+            self.status = "Wall materials applied.".into();
+        }
+        if apply || skip {
+            self.hover_group = None;
+        } else {
+            self.hover_group = hover;
+            self.wall_dialog = Some(rows);
+        }
+    }
+
     // ---------------------------------------------------------------- scanning
 
     fn start_scan(&mut self, ctx: &egui::Context, x_px: f64, y_px: f64) {
@@ -268,6 +397,7 @@ impl App {
         let backend = self.backend;
         let mock = self.mock_aps.clone();
         let ppm = self.px_per_m();
+        let walls_m: Vec<Wall> = self.project.walls.iter().map(|w| w.scaled(1.0 / ppm)).collect();
         let iperf_opts = (self.iperf_on && !self.iperf_server.trim().is_empty()).then(|| {
             let mut o = IperfOptions::new(self.iperf_server.trim());
             o.duration_s = self.iperf_secs;
@@ -280,7 +410,10 @@ impl App {
                 Backend::Real => default_scanner().scan(None),
                 Backend::Simulated => {
                     let mut m = MockScanner::new(mock, 42);
-                    m.path_loss_exponent = 3.9; // walls and clutter
+                    // With real walls modeled use a plain open-space exponent; otherwise fake
+                    // the clutter with a harsher one.
+                    m.path_loss_exponent = if walls_m.iter().any(|w| w.material.is_some()) { 3.0 } else { 3.9 };
+                    m.walls = walls_m;
                     m.scan(Some((x_px / ppm, y_px / ppm)))
                 }
             }
@@ -337,6 +470,14 @@ impl App {
 
     // ---------------------------------------------------------------- analysis
 
+    /// Heatmap trust radius in meters: the user's choice, else ~1/10 of the longest plan side.
+    fn interp_radius_m(&self) -> f64 {
+        self.project.interp_radius_m.unwrap_or_else(|| {
+            let (w, h) = self.plan_size();
+            (w.max(h) / self.px_per_m() / 10.0).clamp(6.0, 15.0)
+        })
+    }
+
     fn idw_params(&self) -> IdwParams {
         let (w, h) = self.plan_size();
         let max_dim = w.max(h);
@@ -344,7 +485,7 @@ impl App {
             Some(s) => IdwParams {
                 cell_px: s.m_to_px(0.5).max(max_dim / 200.0),
                 power: 2.0,
-                max_distance_px: s.m_to_px(8.0),
+                max_distance_px: s.m_to_px(self.interp_radius_m()),
             },
             None => IdwParams { cell_px: (max_dim / 150.0).max(2.0), power: 2.0, max_distance_px: max_dim * 0.2 },
         }
@@ -422,6 +563,22 @@ impl App {
                     self.export_csv();
                 }
             });
+            ui.menu_button("Walls", |ui| {
+                if ui.button("Detect walls from floor plan").clicked() {
+                    ui.close();
+                    self.detect_walls();
+                }
+                if ui.add_enabled(!self.project.walls.is_empty(), egui::Button::new("Set materials by group...")).clicked() {
+                    ui.close();
+                    self.open_group_dialog();
+                }
+                ui.checkbox(&mut self.show_walls, "Show walls");
+                if ui.add_enabled(!self.project.walls.is_empty(), egui::Button::new("Clear all walls")).clicked() {
+                    self.project.walls.clear();
+                    self.selected_wall = None;
+                    ui.close();
+                }
+            });
             ui.menu_button("View", |ui| {
                 if ui.button("Fit plan to window").clicked() {
                     self.fit_pending = true;
@@ -438,6 +595,8 @@ impl App {
                 self.cal_points.clear();
                 self.status = "Click two points on the plan whose real-world distance you know.".into();
             }
+            ui.selectable_value(&mut self.tool, Tool::Walls, "Select walls");
+            ui.selectable_value(&mut self.tool, Tool::DrawWall, "Draw wall");
             ui.separator();
             ui.label("Heatmap:");
             let before = self.metric.clone();
@@ -510,6 +669,21 @@ impl App {
             if changed {
                 self.heat_dirty = true;
             }
+            {
+                let u = self.project.units;
+                let mut r = u.from_m(self.interp_radius_m());
+                ui.horizontal(|ui| {
+                    let slider = egui::Slider::new(&mut r, u.from_m(3.0)..=u.from_m(40.0)).text(format!("radius ({})", u.label()));
+                    if ui.add(slider).on_hover_text("The heatmap only colors areas this close to a survey point.").changed() {
+                        self.project.interp_radius_m = Some(u.to_m(r));
+                        self.heat_dirty = true;
+                    }
+                    if self.project.interp_radius_m.is_some() && ui.small_button("Auto").clicked() {
+                        self.project.interp_radius_m = None;
+                        self.heat_dirty = true;
+                    }
+                });
+            }
             match &self.analysis.coverage {
                 Some(c) if c.surveyed_cells > 0 => {
                     ui.label(format!("{:.1}% of surveyed area meets target", c.pct_of_surveyed()));
@@ -547,6 +721,40 @@ impl App {
             for (title, list) in [("2.4 GHz", &self.analysis.ch24), ("5 GHz", &self.analysis.ch5)] {
                 if let Some(best) = list.first() {
                     ui.label(format!("Quietest {title} channel: {}", best.channel));
+                }
+            }
+            ui.separator();
+
+            ui.heading("Walls");
+            if self.project.walls.is_empty() {
+                ui.weak("None. Use the Walls menu to detect them, or the Draw wall tool.");
+            } else {
+                let unassigned = self.project.walls.iter().filter(|w| w.material.is_none()).count();
+                ui.label(format!("{} walls, {} without a material", self.project.walls.len(), unassigned));
+            }
+            if self.tool == Tool::DrawWall {
+                let mut m = Some(self.last_material);
+                ui.horizontal(|ui| {
+                    ui.label("New walls:");
+                    material_combo(ui, "new_wall_material", &mut m);
+                });
+                if let Some(m) = m {
+                    self.last_material = m;
+                }
+                ui.weak("Click the start and end of each wall. Esc cancels.");
+            }
+            if let Some(i) = self.selected_wall.and_then(|id| self.project.walls.iter().position(|w| w.id == id)) {
+                let (ppm, u) = (self.px_per_m(), self.project.units);
+                let mut delete = false;
+                let wall = &mut self.project.walls[i];
+                ui.horizontal(|ui| {
+                    ui.label(format!("Selected: {:.1} {}", u.from_m(wall.length_px() / ppm), u.label()));
+                    material_combo(ui, "sel_wall_material", &mut wall.material);
+                    delete = ui.small_button("Delete").clicked();
+                });
+                if delete {
+                    self.project.walls.remove(i);
+                    self.selected_wall = None;
                 }
             }
             ui.separator();
@@ -646,6 +854,36 @@ impl App {
             }
         }
 
+        if self.tool != Tool::DrawWall {
+            self.draw_start = None;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.draw_start = None;
+            self.selected_wall = None;
+        }
+        if self.show_walls {
+            let highlight: &[u32] =
+                self.hover_group.and_then(|i| self.wall_dialog.as_ref()?.get(i)).map_or(&[], |r| r.ids.as_slice());
+            for wall in &self.project.walls {
+                let (a, b) = (to_screen(wall.x1, wall.y1), to_screen(wall.x2, wall.y2));
+                let width = (wall.thickness_px as f32 * self.zoom).clamp(2.0, 14.0);
+                if highlight.contains(&wall.id) {
+                    clipped.line_segment([a, b], Stroke::new(width + 6.0, Color32::from_rgb(255, 0, 200)));
+                }
+                if self.selected_wall == Some(wall.id) {
+                    clipped.line_segment([a, b], Stroke::new(width + 5.0, Color32::from_rgb(255, 255, 0)));
+                }
+                clipped.line_segment([a, b], Stroke::new(width, wall_color(wall.material)));
+            }
+        }
+        if let (Some(a), Some(m)) = (self.draw_start, resp.hover_pos()) {
+            clipped.line_segment([to_screen(a.0, a.1), m], Stroke::new(2.0, Color32::from_rgb(255, 200, 0)));
+        }
+        if self.tool == Tool::Walls && self.selected_wall.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.project.walls.retain(|w| Some(w.id) != self.selected_wall);
+            self.selected_wall = None;
+        }
+
         let hover_plan = resp.hover_pos().map(to_plan);
         let mut hovered_point: Option<u32> = None;
         if self.show_points {
@@ -690,6 +928,32 @@ impl App {
                 if x >= 0.0 && y >= 0.0 && x <= pw && y <= ph && hovered_point.is_none() {
                     match self.tool {
                         Tool::Survey => self.start_scan(&ctx, x, y),
+                        Tool::Walls => {
+                            let tol = 8.0 / self.zoom as f64;
+                            self.selected_wall = self
+                                .project
+                                .walls
+                                .iter()
+                                .filter(|w| w.distance_to((x, y)) <= (w.thickness_px / 2.0).max(tol))
+                                .min_by(|a, b| a.distance_to((x, y)).total_cmp(&b.distance_to((x, y))))
+                                .map(|w| w.id);
+                        }
+                        Tool::DrawWall => match self.draw_start.take() {
+                            None => self.draw_start = Some((x, y)),
+                            Some(a) => {
+                                // Snap nearly-straight walls to the axis.
+                                let (mut ex, mut ey) = (x, y);
+                                if (ey - a.1).abs() < (ex - a.0).abs() * 0.05 {
+                                    ey = a.1;
+                                } else if (ex - a.0).abs() < (ey - a.1).abs() * 0.05 {
+                                    ex = a.0;
+                                }
+                                let thickness = self.px_per_m() * 0.15;
+                                let id = self.project.add_wall(a, (ex, ey), thickness, Some(self.last_material));
+                                self.selected_wall = Some(id);
+                                self.status = "Wall added. Click again to start another; Esc to stop.".into();
+                            }
+                        },
                         Tool::Calibrate => {
                             self.cal_points.push((x, y));
                             if self.cal_points.len() == 2 {
@@ -788,5 +1052,6 @@ impl eframe::App for App {
         egui::Panel::right("side").default_size(380.0).show(ui, |ui| self.side_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
         self.calibration_dialog(&ctx);
+        self.wall_dialog_ui(&ctx);
     }
 }

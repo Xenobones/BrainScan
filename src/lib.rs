@@ -7,6 +7,7 @@ pub mod heatmap;
 pub mod iperf;
 pub mod model;
 pub mod scanner;
+pub mod walls;
 
 use std::fmt;
 

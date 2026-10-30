@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::calibration::Scale;
+use crate::walls::{Material, Wall};
 use crate::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -156,6 +157,12 @@ pub struct Project {
     pub noise_floor_dbm: i32,
     #[serde(default)]
     pub units: Units,
+    #[serde(default)]
+    pub walls: Vec<Wall>,
+    /// How far (meters) a survey point's reading is trusted when coloring the heatmap.
+    /// `None` means pick automatically from the plan size.
+    #[serde(default)]
+    pub interp_radius_m: Option<f64>,
 }
 
 impl Project {
@@ -168,6 +175,8 @@ impl Project {
             ap_aliases: BTreeMap::new(),
             noise_floor_dbm: default_noise_floor(),
             units: Units::default(),
+            walls: Vec::new(),
+            interp_radius_m: None,
         }
     }
 
@@ -182,6 +191,13 @@ impl Project {
         let before = self.points.len();
         self.points.retain(|p| p.id != id);
         self.points.len() != before
+    }
+
+    /// Adds a wall (floor-plan pixel coordinates) and returns its id.
+    pub fn add_wall(&mut self, a: (f64, f64), b: (f64, f64), thickness_px: f64, material: Option<Material>) -> u32 {
+        let id = self.walls.iter().map(|w| w.id).max().map_or(1, |m| m + 1);
+        self.walls.push(Wall { id, x1: a.0, y1: a.1, x2: b.0, y2: b.1, thickness_px, material });
+        id
     }
 
     pub fn set_alias(&mut self, bssid: &str, alias: impl Into<String>) {
