@@ -107,6 +107,7 @@ pub struct App {
     cal_points: Vec<(f64, f64)>,
     cal_ready: Option<((f64, f64), (f64, f64))>,
     cal_text: String,
+    cal_focused: bool,
 
     scanning: bool,
     tx: Sender<ScanDone>,
@@ -151,6 +152,7 @@ impl App {
             cal_points: Vec::new(),
             cal_ready: None,
             cal_text: String::new(),
+            cal_focused: false,
             scanning: false,
             tx,
             rx,
@@ -1008,7 +1010,13 @@ impl App {
         egui::Window::new("Set scale").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             ui.label(format!("Real-world distance between the two points ({}):", units.label()));
             let r = ui.text_edit_singleline(&mut self.cal_text);
-            r.request_focus();
+            // Request focus once, not every frame: `request_focus` interrupts the IME (egui-winit
+            // toggles set_ime_allowed off/on), which makes input methods like fcitx5 re-commit the
+            // last character each frame, so typed digits repeat.
+            if !self.cal_focused {
+                r.request_focus();
+                self.cal_focused = true;
+            }
             ui.horizontal(|ui| {
                 let ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ok {
@@ -1032,6 +1040,7 @@ impl App {
         if close {
             self.cal_ready = None;
             self.cal_points.clear();
+            self.cal_focused = false;
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::model::{normalize_bssid, ApReading, Band};
 use crate::walls::{path_loss_db, Wall};
@@ -87,8 +88,11 @@ pub fn parse_nmcli(output: &str) -> Result<Vec<ApReading>> {
 
 // ---------------------------------------------------------------- Linux: iw
 
-/// Uses `iw dev <if> scan` (exact dBm; needs root or CAP_NET_ADMIN to trigger a fresh
-/// scan) and falls back to `scan dump`, the kernel's cached results, which any user can read.
+/// Reads exact dBm from `iw dev <if> scan dump`, which is the kernel's *cache* of scan
+/// results. Triggering a scan needs CAP_NET_ADMIN, which an unprivileged `iw` child never has
+/// (file capabilities on this binary don't pass to it), so instead we ask the network manager
+/// (NetworkManager or iwd) to scan and wait until the cache visibly refreshes. Stale data is
+/// never returned as a scan: a survey built on a cache would be silently fabricated.
 #[derive(Default)]
 pub struct IwScanner {
     /// Wi-Fi interface name; auto-detected from `iw dev` when `None`.
@@ -106,9 +110,59 @@ impl Scanner for IwScanner {
                 i
             }
         };
-        let out = run("iw", &["dev", &iface, "scan"]).or_else(|_| run("iw", &["dev", &iface, "scan", "dump"]))?;
-        parse_iw(&out)
+        // Works only as root (or with ambient capabilities); a fresh scan if it does.
+        if let Ok(out) = run("iw", &["dev", &iface, "scan"]) {
+            return parse_iw(&out);
+        }
+        let start = Instant::now();
+        let trigger = run("nmcli", &["dev", "wifi", "rescan", "ifname", &iface])
+            .or_else(|_| run("iwctl", &["station", &iface, "scan"]))
+            .map(|_| ());
+        let newest_age: Option<u64>;
+        loop {
+            let (readings, age) = parse_iw_with_age(&run("iw", &["dev", &iface, "scan", "dump"])?)?;
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            if cache_is_fresh(age, elapsed_ms, trigger.is_ok()) {
+                return Ok(readings);
+            }
+            if start.elapsed() > SCAN_WAIT {
+                newest_age = age;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        Err(Error::Command(match (trigger, newest_age) {
+            (Err(e), Some(a)) => format!("could not trigger a Wi-Fi scan ({e}); the cached results are {}s old", a / 1000),
+            (Err(e), None) => format!("could not trigger a Wi-Fi scan ({e}) and there are no cached results"),
+            (Ok(()), Some(a)) => format!("the scan was requested but the results never refreshed (newest is {}s old)", a / 1000),
+            (Ok(()), None) => "the scan was requested but no networks were reported".into(),
+        }))
     }
+}
+
+/// How long to wait for a requested scan to land in the cache.
+const SCAN_WAIT: Duration = Duration::from_secs(8);
+/// If the scan request was refused (managers rate-limit rescans), cached results this recent
+/// are still genuinely current.
+const RECENT_CACHE_MS: u64 = 15_000;
+
+/// `age_ms`: age of the *newest* BSS in the cache. After a successful trigger, fresh means at
+/// least one entry was updated since the request; otherwise it must be recent in absolute terms.
+fn cache_is_fresh(age_ms: Option<u64>, elapsed_since_trigger_ms: u64, trigger_ok: bool) -> bool {
+    match age_ms {
+        Some(a) if trigger_ok => a <= elapsed_since_trigger_ms + 500,
+        Some(a) => a <= RECENT_CACHE_MS,
+        None => false,
+    }
+}
+
+/// Like [`parse_iw`], plus the age in ms of the most recently seen BSS (from `last seen: N ms ago`).
+pub fn parse_iw_with_age(output: &str) -> Result<(Vec<ApReading>, Option<u64>)> {
+    let age = output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("last seen:")?.trim().strip_suffix("ms ago")?.trim().parse::<u64>().ok())
+        .min();
+    Ok((parse_iw(output)?, age))
 }
 
 pub fn parse_iw_interface(output: &str) -> Option<String> {
@@ -417,6 +471,26 @@ BSS 02:00:00:aa:bb:01(on wlp0s20f3) -- associated
             (r[0].bssid.as_str(), r[0].ssid.as_str(), r[0].rssi_dbm, r[0].channel, r[0].band),
             ("02:00:00:aa:bb:01", "examplenet", -50, 36, Band::Ghz5)
         );
+    }
+
+    #[test]
+    fn reports_cache_age_and_judges_freshness() {
+        // the real AX201 fixture's only BSS was last seen 144712 ms ago
+        let (r, age) = parse_iw_with_age(IW_AX201).unwrap();
+        assert_eq!((r.len(), age), (1, Some(144_712)));
+        assert_eq!(parse_iw_with_age("").unwrap().1, None);
+        // the boottime "last seen: 226865.745s" line must not be mistaken for an age
+        let no_age = IW_AX201.replace("\tlast seen: 144712 ms ago\n", "");
+        assert_eq!(parse_iw_with_age(&no_age).unwrap().1, None);
+
+        // after a successful trigger, the old 144 s cache is stale however long we wait under 144 s
+        assert!(!cache_is_fresh(Some(144_712), 3_000, true));
+        assert!(cache_is_fresh(Some(1_200), 3_000, true)); // updated since the request
+        assert!(!cache_is_fresh(Some(4_000), 3_000, true)); // older than the request
+        // refused trigger: only a genuinely recent cache counts
+        assert!(cache_is_fresh(Some(9_000), 0, false));
+        assert!(!cache_is_fresh(Some(47_000), 0, false));
+        assert!(!cache_is_fresh(None, 5_000, true));
     }
 
     #[test]
