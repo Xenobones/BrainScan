@@ -115,15 +115,29 @@ impl Scanner for IwScanner {
             return parse_iw(&out);
         }
         let start = Instant::now();
-        let trigger = run("nmcli", &["dev", "wifi", "rescan", "ifname", &iface])
+        // `nmcli ... list --rescan yes` blocks until the sweep completes; `iwctl scan` returns at
+        // once, so the settle check below covers it.
+        let trigger = run("nmcli", &["-t", "-f", "BSSID", "dev", "wifi", "list", "ifname", &iface, "--rescan", "yes"])
             .or_else(|_| run("iwctl", &["station", &iface, "scan"]))
             .map(|_| ());
+        let mut last_count: Option<usize> = None;
+        let mut stable_since = Instant::now();
         let newest_age: Option<u64>;
         loop {
             let (readings, age) = parse_iw_with_age(&run("iw", &["dev", &iface, "scan", "dump"])?)?;
             let elapsed_ms = start.elapsed().as_millis() as u64;
             if cache_is_fresh(age, elapsed_ms, trigger.is_ok()) {
-                return Ok(readings);
+                // The first BSS to land makes the cache "fresh", but a sweep fills in over a
+                // second or more. Wait until the count stops growing.
+                if last_count != Some(readings.len()) {
+                    last_count = Some(readings.len());
+                    stable_since = Instant::now();
+                }
+                if stable_since.elapsed() >= SETTLE || start.elapsed() > SCAN_WAIT {
+                    return Ok(readings);
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                continue;
             }
             if start.elapsed() > SCAN_WAIT {
                 newest_age = age;
@@ -142,6 +156,8 @@ impl Scanner for IwScanner {
 
 /// How long to wait for a requested scan to land in the cache.
 const SCAN_WAIT: Duration = Duration::from_secs(8);
+/// How long the BSS count must hold steady before a refreshed cache counts as a finished sweep.
+const SETTLE: Duration = Duration::from_millis(1500);
 /// If the scan request was refused (managers rate-limit rescans), cached results this recent
 /// are still genuinely current.
 const RECENT_CACHE_MS: u64 = 15_000;
