@@ -379,6 +379,41 @@ BSS aa:bb:cc:dd:ee:03(on wlan0)
 \tSSID: Six
 ";
 
+    /// Real `iw dev wlp0s20f3 scan dump` output from an Intel AX201 (BSSID/SSID anonymized,
+    /// country-IE channel list trimmed): note the duplicate "last seen" lines and nested IEs.
+    const IW_AX201: &str = "\
+BSS 02:00:00:aa:bb:01(on wlp0s20f3) -- associated
+\tlast seen: 226865.745s [boottime]
+\tTSF: 2888860797567 usec (33d, 10:27:40)
+\tfreq: 5180.0
+\tbeacon interval: 100 TUs
+\tcapability: ESS Privacy SpectrumMgmt ShortSlotTime RadioMeasure (0x1511)
+\tsignal: -50.00 dBm
+\tlast seen: 144712 ms ago
+\tInformation elements from Probe Response frame:
+\tSSID: examplenet
+\tSupported rates: 6.0* 9.0 12.0* 18.0 24.0* 36.0 48.0 54.0 
+\tDS Parameter set: channel 36
+\tCountry: US\tEnvironment: Indoor/Outdoor
+\t\tChannels [36 - 36] @ 30 dBm
+\t\tChannels [40 - 40] @ 30 dBm
+\tRSN:\t * Version: 1
+\t\t * Group cipher: CCMP
+\tBSS Load:
+\t\t * station count: 5
+\t\t * channel utilisation: 8/255
+";
+
+    #[test]
+    fn parses_real_ax201_iw_output() {
+        let r = parse_iw(IW_AX201).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (r[0].bssid.as_str(), r[0].ssid.as_str(), r[0].rssi_dbm, r[0].channel, r[0].band),
+            ("02:00:00:aa:bb:01", "examplenet", -50, 36, Band::Ghz5)
+        );
+    }
+
     #[test]
     fn parses_iw_exact_dbm_and_channels() {
         let r = parse_iw(IW).unwrap();
