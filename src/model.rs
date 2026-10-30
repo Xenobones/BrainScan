@@ -42,6 +42,49 @@ impl Band {
     }
 }
 
+/// Display units for distances. Everything is stored in meters; this only changes what the
+/// user sees and types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Units {
+    #[default]
+    Meters,
+    Feet,
+}
+
+const FEET_PER_METER: f64 = 3.280_839_895;
+
+impl Units {
+    /// Units per meter (1 for meters, ~3.28 for feet).
+    pub fn per_meter(self) -> f64 {
+        match self {
+            Units::Meters => 1.0,
+            Units::Feet => FEET_PER_METER,
+        }
+    }
+
+    pub fn from_m(self, meters: f64) -> f64 {
+        meters * self.per_meter()
+    }
+
+    pub fn to_m(self, value: f64) -> f64 {
+        value / self.per_meter()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Units::Meters => "m",
+            Units::Feet => "ft",
+        }
+    }
+
+    pub fn area_label(self) -> &'static str {
+        match self {
+            Units::Meters => "m²",
+            Units::Feet => "ft²",
+        }
+    }
+}
+
 /// Lowercase, colon-separated MAC form so BSSIDs compare reliably across scanners.
 pub fn normalize_bssid(s: &str) -> String {
     s.trim().replace('-', ":").to_ascii_lowercase()
@@ -111,6 +154,8 @@ pub struct Project {
     /// Used for SNR when the scanner doesn't report noise.
     #[serde(default = "default_noise_floor")]
     pub noise_floor_dbm: i32,
+    #[serde(default)]
+    pub units: Units,
 }
 
 impl Project {
@@ -122,6 +167,7 @@ impl Project {
             points: Vec::new(),
             ap_aliases: BTreeMap::new(),
             noise_floor_dbm: default_noise_floor(),
+            units: Units::default(),
         }
     }
 
@@ -290,6 +336,16 @@ mod tests {
         assert_eq!(pt.strongest().unwrap().ssid, "B");
         assert_eq!(pt.reading_for("AA-AA-AA-AA-AA-01").unwrap().rssi_dbm, -70);
         assert!(pt.reading_for("00:00:00:00:00:00").is_none());
+    }
+
+    #[test]
+    fn unit_conversion_round_trips() {
+        assert!((Units::Feet.from_m(1.0) - 3.2808).abs() < 1e-4);
+        assert!((Units::Feet.to_m(Units::Feet.from_m(12.5)) - 12.5).abs() < 1e-9);
+        assert_eq!(Units::Meters.from_m(7.0), 7.0);
+        let mut p = Project::new("t");
+        p.units = Units::Feet;
+        assert_eq!(Project::from_json(&p.to_json().unwrap()).unwrap().units, Units::Feet);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use brainscan::analysis::{
 use brainscan::calibration::Scale;
 use brainscan::heatmap::{self, Grid, IdwParams, Metric, Ramp};
 use brainscan::iperf::{self, IperfOptions};
-use brainscan::model::{ApReading, Band, FloorPlan, Project, Throughput};
+use brainscan::model::{ApReading, Band, FloorPlan, Project, Throughput, Units};
 use brainscan::scanner::{default_scanner, MockAp, MockScanner, Scanner};
 use eframe::egui::{self, Color32, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 
@@ -485,11 +485,20 @@ impl App {
                     ui.weak("Simulated scanner fakes throughput from signal; no server needed.");
                 }
             }
+            ui.horizontal(|ui| {
+                ui.label("Units:");
+                ui.radio_value(&mut self.project.units, Units::Meters, "Meters");
+                ui.radio_value(&mut self.project.units, Units::Feet, "Feet");
+            });
             ui.label(format!("{} survey points", self.project.points.len()));
             ui.horizontal(|ui| {
                 ui.label("Scale:");
                 match self.project.scale {
-                    Some(s) => ui.label(format!("{:.1} px/m", s.pixels_per_meter)),
+                    Some(s) => ui.label(format!(
+                        "{:.1} px/{}",
+                        s.pixels_per_meter / self.project.units.per_meter(),
+                        self.project.units.label()
+                    )),
                     None => ui.colored_label(Color32::from_rgb(200, 120, 0), "not calibrated"),
                 };
             });
@@ -511,13 +520,17 @@ impl App {
                 }
             }
             let ppm = self.px_per_m();
+            let u = self.project.units;
             for (i, z) in self.analysis.zones.iter().take(6).enumerate() {
+                let area = u.from_m(u.from_m(z.area_px2 / (ppm * ppm)));
                 ui.label(format!(
-                    "Dead zone {}: {:.0} m² near ({:.0}, {:.0}) m, worst {:.0} dBm",
+                    "Dead zone {}: {:.0} {} near ({:.0}, {:.0}) {}, worst {:.0} dBm",
                     i + 1,
-                    z.area_px2 / (ppm * ppm),
-                    z.centroid.0 / ppm,
-                    z.centroid.1 / ppm,
+                    area,
+                    u.area_label(),
+                    u.from_m(z.centroid.0 / ppm),
+                    u.from_m(z.centroid.1 / ppm),
+                    u.label(),
                     z.worst_value
                 ));
             }
@@ -692,7 +705,8 @@ impl App {
         self.draw_legend(&painter, rect, ui);
         if let Some((x, y)) = hover_plan {
             let ppm = self.px_per_m();
-            let t = format!("{:.1} m, {:.1} m", x / ppm, y / ppm);
+            let u = self.project.units;
+            let t = format!("{:.1} {l}, {:.1} {l}", u.from_m(x / ppm), u.from_m(y / ppm), l = u.label());
             painter.text(rect.right_bottom() - Vec2::new(8.0, 8.0), egui::Align2::RIGHT_BOTTOM, t, egui::FontId::monospace(12.0), ui.visuals().text_color());
         }
         if self.scanning {
@@ -726,14 +740,15 @@ impl App {
     fn calibration_dialog(&mut self, ctx: &egui::Context) {
         let Some((a, b)) = self.cal_ready else { return };
         let mut close = false;
+        let units = self.project.units;
         egui::Window::new("Set scale").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label("Real-world distance between the two points (meters):");
+            ui.label(format!("Real-world distance between the two points ({}):", units.label()));
             let r = ui.text_edit_singleline(&mut self.cal_text);
             r.request_focus();
             ui.horizontal(|ui| {
                 let ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ok {
-                    match self.cal_text.trim().parse::<f64>().map_err(|e| e.to_string()).and_then(|m| Scale::from_two_points(a, b, m).map_err(|e| e.to_string())) {
+                    match self.cal_text.trim().parse::<f64>().map_err(|e| e.to_string()).and_then(|m| Scale::from_two_points(a, b, units.to_m(m)).map_err(|e| e.to_string())) {
                         Ok(s) => {
                             self.status = format!("Scale set: {:.1} px per meter", s.pixels_per_meter);
                             self.project.scale = Some(s);
