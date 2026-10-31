@@ -6,6 +6,7 @@ pub mod calibration;
 pub mod heatmap;
 pub mod iperf;
 pub mod model;
+pub mod predict;
 pub mod scanner;
 pub mod walls;
 

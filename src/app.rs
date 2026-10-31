@@ -1,5 +1,6 @@
 //! egui front end: floor plan canvas, click-to-survey, heatmap overlay, analysis panels.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -10,6 +11,7 @@ use brainscan::calibration::Scale;
 use brainscan::heatmap::{self, Grid, IdwParams, Metric, Ramp};
 use brainscan::iperf::{self, IperfOptions};
 use brainscan::model::{ApReading, Band, FloorPlan, Project, Throughput, Units};
+use brainscan::predict::{self, PredAp};
 use brainscan::scanner::{default_scanner, MockAp, MockScanner, Scanner};
 use brainscan::walls::{self, DetectOptions, Material, Wall, WallGroup};
 use eframe::egui::{self, Color32, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
@@ -21,6 +23,32 @@ enum Tool {
     Walls,
     DrawWall,
     PlaceAp,
+    WhatIf,
+}
+
+/// What-if scenario layered over the surveyed APs; never saved into the project.
+struct WhatIf {
+    band: Band,
+    /// Surveyed AP (BSSID) -> hypothetical position, plan px.
+    moves: BTreeMap<String, (f64, f64)>,
+    /// Surveyed APs switched off in the scenario.
+    off: BTreeSet<String>,
+    /// New APs that don't exist yet, plan px.
+    candidates: Vec<(f64, f64)>,
+    model: Option<predict::Model>,
+    /// Share of the plan meeting the target: (as placed, with the scenario).
+    covered_pct: Option<(f64, f64)>,
+}
+
+impl Default for WhatIf {
+    fn default() -> Self {
+        WhatIf { band: Band::Ghz5, moves: BTreeMap::new(), off: BTreeSet::new(), candidates: Vec::new(), model: None, covered_pct: None }
+    }
+}
+
+enum WiDrag {
+    Ap(String),
+    Candidate(usize),
 }
 
 /// One row of the "what are these walls made of?" dialog.
@@ -92,6 +120,9 @@ pub struct App {
     opacity: f32,
     show_points: bool,
     show_aps: bool,
+    whatif_on: bool,
+    whatif: WhatIf,
+    wi_drag: Option<WiDrag>,
     /// BSSID waiting to be placed with the next canvas click (Place AP tool).
     placing_ap: Option<String>,
     show_zones: bool,
@@ -155,6 +186,9 @@ impl App {
             opacity: 0.85,
             show_points: true,
             show_aps: true,
+            whatif_on: false,
+            whatif: WhatIf::default(),
+            wi_drag: None,
             placing_ap: None,
             show_zones: true,
             show_walls: true,
@@ -193,6 +227,7 @@ impl App {
 
     fn new_blank(&mut self, w_m: f64, h_m: f64) {
         self.project = Project::new("Blank canvas");
+        self.whatif = WhatIf::default();
         self.project.scale = Some(Scale { pixels_per_meter: DEFAULT_PX_PER_M });
         self.project.floor_plan = Some(FloorPlan {
             image_path: String::new(),
@@ -314,6 +349,7 @@ impl App {
         match Project::load(path) {
             Ok(p) => {
                 self.project = p;
+                self.whatif = WhatIf::default();
                 self.path = Some(path.to_path_buf());
                 self.plan_tex = None;
                 let plan_path = self.project.floor_plan.as_ref().map(|f| f.image_path.clone()).unwrap_or_default();
@@ -558,17 +594,89 @@ impl App {
         }
     }
 
+    /// Predicted best-signal grid with the what-if changes applied; also fills in the model and
+    /// before/after coverage. `None` (with an explanation in `status`) if it can't be predicted.
+    fn predict_scenario(&mut self, params: &IdwParams) -> Option<Grid> {
+        self.whatif.model = None;
+        self.whatif.covered_pct = None;
+        let Some(scale) = self.project.scale else {
+            self.status = "What-if needs a scale: use Calibrate scale first.".into();
+            return None;
+        };
+        let model = predict::fit(&self.project, &scale);
+        let band = self.whatif.band;
+        let pct = |g: &Grid| {
+            let c = analysis::coverage(g, self.target_dbm);
+            100.0 * c.covered_cells as f64 / c.total_cells.max(1) as f64
+        };
+        let mut aps: Vec<PredAp> = model
+            .aps
+            .iter()
+            .filter(|a| !self.whatif.off.contains(&a.bssid))
+            .map(|a| PredAp { pos: self.whatif.moves.get(&a.bssid).copied().unwrap_or(a.pos), ..a.clone() })
+            .collect();
+        let on_band: Vec<f64> = model.aps.iter().filter(|a| a.band == band).map(|a| a.rssi_at_1m).collect();
+        let typical = if on_band.is_empty() { predict::default_rssi_at_1m(band) } else { on_band.iter().sum::<f64>() / on_band.len() as f64 };
+        aps.extend(self.whatif.candidates.iter().map(|&pos| PredAp { bssid: String::new(), pos, band, rssi_at_1m: typical }));
+
+        let before = predict::predict_grid(&self.project, &scale, &model.aps, model.exponent, band, params.cell_px);
+        let after = predict::predict_grid(&self.project, &scale, &aps, model.exponent, band, params.cell_px);
+        if let (Some(b), Some(a)) = (&before, &after) {
+            self.whatif.covered_pct = Some((pct(b), pct(a)));
+        }
+        let usable = model.aps.iter().any(|a| a.band == band) || !self.whatif.candidates.is_empty();
+        self.whatif.model = Some(model);
+        if !usable {
+            self.status = format!("No placed {} APs yet: place your APs (Place AP tool) or add a new one.", band.label());
+            return None;
+        }
+        after
+    }
+
+    /// In what-if mode only APs on the band being predicted are shown and editable.
+    fn in_whatif_band(&self, bssid: &str) -> bool {
+        self.analysis.aps.iter().find(|a| a.bssid == bssid).is_none_or(|a| a.band == self.whatif.band)
+    }
+
+    /// What-if marker under `m`, using the canvas `origin` of the moment.
+    fn whatif_hit(&self, m: Pos2, origin: Pos2) -> Option<WiDrag> {
+        let at = |p: (f64, f64)| origin + Vec2::new(p.0 as f32, p.1 as f32) * self.zoom;
+        for (i, &c) in self.whatif.candidates.iter().enumerate() {
+            if at(c).distance(m) < 14.0 {
+                return Some(WiDrag::Candidate(i));
+            }
+        }
+        for (b, &p) in &self.project.ap_positions {
+            if !self.in_whatif_band(b) {
+                continue;
+            }
+            let p = self.whatif.moves.get(b).copied().unwrap_or(p);
+            if at(p).distance(m) < 14.0 {
+                return Some(WiDrag::Ap(b.clone()));
+            }
+        }
+        None
+    }
+
     fn refresh(&mut self, ctx: &egui::Context) {
         if !self.heat_dirty {
             return;
         }
         self.heat_dirty = false;
         let params = self.idw_params();
-        let signal = heatmap::build(&self.project, &Metric::Signal, &params);
-        let view = if self.metric == Metric::Signal { signal.clone() } else { heatmap::build(&self.project, &self.metric, &params) };
+        let predicted = if self.whatif_on { self.predict_scenario(&params) } else { None };
+        let signal = predicted.clone().or_else(|| heatmap::build(&self.project, &Metric::Signal, &params));
+        let view = if predicted.is_some() {
+            predicted
+        } else if self.metric == Metric::Signal {
+            signal.clone()
+        } else {
+            heatmap::build(&self.project, &self.metric, &params)
+        };
+        let ramp = if self.whatif_on { Ramp::signal() } else { self.current_ramp() };
 
         self.heat_tex = view.as_ref().map(|g| {
-            let ci = egui::ColorImage::from_rgba_unmultiplied([g.cols, g.rows], &g.to_rgba(&self.current_ramp()));
+            let ci = egui::ColorImage::from_rgba_unmultiplied([g.cols, g.rows], &g.to_rgba(&ramp));
             ctx.load_texture("heat", ci, egui::TextureOptions::LINEAR)
         });
         self.heat_grid = view;
@@ -652,6 +760,11 @@ impl App {
             ui.selectable_value(&mut self.tool, Tool::Walls, "Select walls");
             ui.selectable_value(&mut self.tool, Tool::DrawWall, "Draw wall");
             ui.selectable_value(&mut self.tool, Tool::PlaceAp, "Place AP");
+            if ui.selectable_value(&mut self.tool, Tool::WhatIf, "What-if").clicked() {
+                self.whatif_on = true;
+                self.heat_dirty = true;
+                self.status = "What-if: drag an AP to move it, click empty floor to add a new AP, Delete switches one off.".into();
+            }
             ui.separator();
             ui.label("Heatmap:");
             let before = self.metric.clone();
@@ -815,6 +928,9 @@ impl App {
             }
             ui.separator();
 
+            self.whatif_section(ui);
+            ui.separator();
+
             ui.heading("Access points");
             let mut alias_edits: Vec<(String, String)> = Vec::new();
             let mut pick: Option<String> = None;
@@ -877,6 +993,38 @@ impl App {
         });
     }
 
+    fn whatif_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("What-if planning");
+        let before = (self.whatif_on, self.whatif.band);
+        ui.checkbox(&mut self.whatif_on, "Show predicted coverage");
+        if self.whatif_on {
+            ui.horizontal(|ui| {
+                ui.label("Band:");
+                ui.selectable_value(&mut self.whatif.band, Band::Ghz2_4, "2.4 GHz");
+                ui.selectable_value(&mut self.whatif.band, Band::Ghz5, "5 GHz");
+            });
+            ui.weak("Uses only the APs you placed, and the walls and materials on the plan.");
+            if let Some(m) = &self.whatif.model {
+                let fit = m.rms_db.map_or("not enough readings to check".to_string(), |r| format!("fits your survey to within about {r:.0} dB"));
+                ui.label(format!("Model: path-loss exponent {:.1}, {fit} ({} readings).", m.exponent, m.samples));
+            }
+            if let Some((a, b)) = self.whatif.covered_pct {
+                ui.label(format!("Plan meeting {:.0} dBm: {:.0}% as placed, {:.0}% with your changes.", self.target_dbm, a, b));
+            }
+            let edits = self.whatif.moves.len() + self.whatif.off.len() + self.whatif.candidates.len();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(edits > 0, egui::Button::new(format!("Reset changes ({edits})"))).clicked() {
+                    self.whatif = WhatIf { band: self.whatif.band, ..WhatIf::default() };
+                    self.heat_dirty = true;
+                }
+            });
+            ui.weak("What-if tool: drag an AP to move it; click empty floor to add a new AP; Delete over an AP switches it off (again to restore).");
+        }
+        if (self.whatif_on, self.whatif.band) != before {
+            self.heat_dirty = true;
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
@@ -889,6 +1037,12 @@ impl App {
             self.fit_pending = false;
         }
 
+        let origin0 = rect.min + self.pan;
+        if self.whatif_on && self.tool == Tool::WhatIf && resp.drag_started_by(PointerButton::Primary) {
+            if let Some(m) = ctx.input(|i| i.pointer.press_origin()) {
+                self.wi_drag = self.whatif_hit(m, origin0);
+            }
+        }
         if resp.hovered() {
             let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
@@ -901,7 +1055,27 @@ impl App {
             }
         }
         if resp.dragged() {
-            self.pan += resp.drag_delta();
+            match (&self.wi_drag, resp.interact_pointer_pos()) {
+                (Some(d), Some(m)) => {
+                    let v = (m - (rect.min + self.pan)) / self.zoom;
+                    let pos = ((v.x as f64).clamp(0.0, pw), (v.y as f64).clamp(0.0, ph));
+                    match d {
+                        WiDrag::Ap(b) => {
+                            self.whatif.moves.insert(b.clone(), pos);
+                        }
+                        WiDrag::Candidate(i) => {
+                            if let Some(c) = self.whatif.candidates.get_mut(*i) {
+                                *c = pos;
+                            }
+                        }
+                    }
+                    self.heat_dirty = true;
+                }
+                _ => self.pan += resp.drag_delta(),
+            }
+        }
+        if resp.drag_stopped() {
+            self.wi_drag = None;
         }
 
         let origin = rect.min + self.pan;
@@ -996,7 +1170,18 @@ impl App {
 
         if self.show_aps {
             let mut hovered_ap: Option<String> = None;
-            for (bssid, &(x, y)) in &self.project.ap_positions {
+            let wi = self.whatif_on;
+            for (bssid, &(ox, oy)) in &self.project.ap_positions {
+                let moved = if wi { self.whatif.moves.get(bssid).copied() } else { None };
+                let (x, y) = moved.unwrap_or((ox, oy));
+                if wi && !self.in_whatif_band(bssid) {
+                    continue;
+                }
+                let off = wi && self.whatif.off.contains(bssid);
+                if moved.is_some() {
+                    clipped.line_segment([to_screen(ox, oy), to_screen(x, y)], Stroke::new(1.5, Color32::from_rgb(20, 90, 220)));
+                    clipped.circle_stroke(to_screen(ox, oy), 5.0, Stroke::new(1.5, Color32::from_rgb(20, 90, 220)));
+                }
                 let c = to_screen(x, y);
                 let near = resp.hover_pos().is_some_and(|m| m.distance(c) < 12.0);
                 if near {
@@ -1004,16 +1189,40 @@ impl App {
                 }
                 let r = if near { 9.0 } else { 7.0 };
                 let diamond = vec![c + Vec2::new(0.0, -r), c + Vec2::new(r, 0.0), c + Vec2::new(0.0, r), c + Vec2::new(-r, 0.0)];
-                clipped.add(egui::Shape::convex_polygon(diamond, Color32::from_rgb(20, 90, 220), Stroke::new(1.5, Color32::WHITE)));
+                let fill = if off { Color32::from_gray(150) } else { Color32::from_rgb(20, 90, 220) };
+                clipped.add(egui::Shape::convex_polygon(diamond, fill, Stroke::new(1.5, Color32::WHITE)));
                 let name = self.analysis.aps.iter().find(|a| &a.bssid == bssid).map_or_else(|| bssid.clone(), |a| format!("{} ch{}", a.name, a.channel));
                 let galley = painter.layout_no_wrap(name, egui::FontId::proportional(12.0), Color32::BLACK);
                 let pos = c + Vec2::new(r + 3.0, -galley.size().y / 2.0);
                 clipped.rect_filled(Rect::from_min_size(pos, galley.size()).expand(2.0), 2.0, Color32::from_white_alpha(210));
                 clipped.galley(pos, galley, Color32::BLACK);
             }
-            if let Some(b) = hovered_ap {
-                if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-                    self.project.ap_positions.remove(&b);
+            let mut hovered_cand: Option<usize> = None;
+            if wi {
+                for (i, &(x, y)) in self.whatif.candidates.iter().enumerate() {
+                    let c = to_screen(x, y);
+                    if resp.hover_pos().is_some_and(|m| m.distance(c) < 12.0) {
+                        hovered_cand = Some(i);
+                    }
+                    let r = 8.0;
+                    let diamond = vec![c + Vec2::new(0.0, -r), c + Vec2::new(r, 0.0), c + Vec2::new(0.0, r), c + Vec2::new(-r, 0.0)];
+                    clipped.add(egui::Shape::convex_polygon(diamond, Color32::from_rgb(240, 150, 20), Stroke::new(1.5, Color32::WHITE)));
+                    clipped.text(c + Vec2::new(r + 3.0, 0.0), egui::Align2::LEFT_CENTER, "new", egui::FontId::proportional(12.0), Color32::from_rgb(240, 150, 20));
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+                if let (true, Some(i)) = (wi, hovered_cand) {
+                    self.whatif.candidates.remove(i);
+                    self.heat_dirty = true;
+                } else if let Some(b) = hovered_ap {
+                    if wi {
+                        if !self.whatif.off.remove(&b) {
+                            self.whatif.off.insert(b);
+                        }
+                        self.heat_dirty = true;
+                    } else {
+                        self.project.ap_positions.remove(&b);
+                    }
                 }
             }
         }
@@ -1059,6 +1268,12 @@ impl App {
                                 self.status = "Wall added. Click again to start another; Esc to stop.".into();
                             }
                         },
+                        Tool::WhatIf => {
+                            if self.whatif_hit(resp.interact_pointer_pos().unwrap_or(Pos2::ZERO), origin).is_none() {
+                                self.whatif.candidates.push((x, y));
+                                self.heat_dirty = true;
+                            }
+                        }
                         Tool::PlaceAp => match self.placing_ap.take() {
                             Some(b) => {
                                 self.project.set_ap_position(&b, (x, y));

@@ -15,6 +15,7 @@ Status: core engine done and tested; first GUI working (survey, heatmaps, analys
 | `heatmap` | IDW interpolation with a distance cutoff; signal, SNR, throughput and per-AP views; color ramps |
 | `analysis` | Coverage %, dead zones, per-AP summaries, co/adjacent-channel interference, channel suggestions |
 | `scanner` | `Scanner` trait with `iw` and `nmcli` (Linux), `netsh` (Windows) and mock backends |
+| `predict` | Path-loss model fitted to the survey; predicted coverage for what-if AP moves |
 | `walls` | Wall model, material attenuation table, floor-plan wall detection and grouping |
 | `iperf` | Builds and parses `iperf3 -J` runs (TCP and UDP) |
 
@@ -36,6 +37,15 @@ them (exterior / thick / thin interior) and asks what each group is made of. Fix
 with the Select walls tool, add missed ones (diagonals aren't detected) with Draw wall. Materials
 carry typical attenuation figures (rough rules of thumb). Measured survey data is never altered by
 walls; they drive the simulated scanner and, later, prediction.
+
+Access points: the Place AP tool (or the place/move buttons in the AP list) puts each AP on the
+plan; "Estimate" guesses positions from the survey.
+
+What-if: the What-if tool predicts coverage from your placed APs, the walls and their materials.
+The model's path-loss exponent and each AP's strength are fitted to your survey, and the panel
+shows how closely it matches. Drag an AP to move it, click empty floor to add a new one, Delete
+switches one off; the panel compares coverage as placed vs. with your changes. Scenarios aren't
+saved. Predictions are only as good as the walls and survey you gave it.
 
 ## Engine checks
 
