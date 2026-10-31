@@ -109,6 +109,11 @@ pub struct App {
     cal_text: String,
     cal_focused: bool,
 
+    /// File chooser running on its own thread. The portal's sync API blocks until the user
+    /// picks, and blocking the UI thread stops Wayland event dispatch (compositor "not
+    /// responding" after a few seconds).
+    dialog: Option<(PendingDialog, Receiver<Option<PathBuf>>)>,
+
     scanning: bool,
     tx: Sender<ScanDone>,
     rx: Receiver<ScanDone>,
@@ -118,6 +123,14 @@ pub struct App {
     mock_aps: Vec<MockAp>,
 
     status: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PendingDialog {
+    OpenPlan,
+    OpenProject,
+    SaveProject,
+    ExportCsv,
 }
 
 const DEFAULT_PX_PER_M: f64 = 20.0;
@@ -154,6 +167,7 @@ impl App {
             cal_text: String::new(),
             cal_focused: false,
             scanning: false,
+            dialog: None,
             tx,
             rx,
             iperf_on: false,
@@ -232,8 +246,51 @@ impl App {
         Ok(())
     }
 
-    fn open_plan_dialog(&mut self, ctx: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file() else { return };
+    /// Opens a file chooser on a worker thread; `poll_dialog` runs the matching handler.
+    fn start_dialog(&mut self, kind: PendingDialog, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let name = format!("{}.brainscan", self.project.name);
+        let (tx, rx) = channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let d = rfd::FileDialog::new();
+            let picked = match kind {
+                PendingDialog::OpenPlan => d.add_filter("Images", &["png", "jpg", "jpeg"]).pick_file(),
+                PendingDialog::OpenProject => d.add_filter("BrainScan project", &["brainscan", "json"]).pick_file(),
+                PendingDialog::SaveProject => d.add_filter("BrainScan project", &["brainscan"]).set_file_name(name).save_file(),
+                PendingDialog::ExportCsv => d.add_filter("CSV", &["csv"]).set_file_name("survey.csv").save_file(),
+            };
+            let _ = tx.send(picked);
+            repaint.request_repaint();
+        });
+        self.dialog = Some((kind, rx));
+    }
+
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some((kind, rx)) = &self.dialog else { return };
+        let kind = *kind;
+        let picked = match rx.try_recv() {
+            Ok(p) => p,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.dialog = None;
+        let Some(path) = picked else { return };
+        match kind {
+            PendingDialog::OpenPlan => self.open_plan(&path, ctx),
+            PendingDialog::OpenProject => self.open_project(&path, ctx),
+            PendingDialog::SaveProject => self.save_to(path),
+            PendingDialog::ExportCsv => self.export_csv_to(&path),
+        }
+    }
+
+    fn open_plan(&mut self, path: &Path, ctx: &egui::Context) {
+        let path = path.to_path_buf();
         match self.load_plan(&path, ctx) {
             Ok(()) => {
                 self.reset_mock_aps();
@@ -271,20 +328,14 @@ impl App {
         }
     }
 
-    fn save(&mut self, as_new: bool) {
-        let path = match (&self.path, as_new) {
-            (Some(p), false) => p.clone(),
-            _ => {
-                let Some(p) = rfd::FileDialog::new()
-                    .add_filter("BrainScan project", &["brainscan"])
-                    .set_file_name(format!("{}.brainscan", self.project.name))
-                    .save_file()
-                else {
-                    return;
-                };
-                p
-            }
-        };
+    fn save(&mut self, as_new: bool, ctx: &egui::Context) {
+        match (&self.path, as_new) {
+            (Some(p), false) => self.save_to(p.clone()),
+            _ => self.start_dialog(PendingDialog::SaveProject, ctx),
+        }
+    }
+
+    fn save_to(&mut self, path: PathBuf) {
         match self.project.save(&path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
@@ -294,11 +345,8 @@ impl App {
         }
     }
 
-    fn export_csv(&mut self) {
-        let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("survey.csv").save_file() else {
-            return;
-        };
-        self.status = match std::fs::write(&path, self.project.to_csv()) {
+    fn export_csv_to(&mut self, path: &Path) {
+        self.status = match std::fs::write(path, self.project.to_csv()) {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };
@@ -542,27 +590,25 @@ impl App {
                 }
                 if ui.button("Open floor plan image...").clicked() {
                     ui.close();
-                    self.open_plan_dialog(&ctx);
+                    self.start_dialog(PendingDialog::OpenPlan, &ctx);
                 }
                 ui.separator();
                 if ui.button("Open project...").clicked() {
                     ui.close();
-                    if let Some(p) = rfd::FileDialog::new().add_filter("BrainScan project", &["brainscan", "json"]).pick_file() {
-                        self.open_project(&p, &ctx);
-                    }
+                    self.start_dialog(PendingDialog::OpenProject, &ctx);
                 }
                 if ui.button("Save").clicked() {
                     ui.close();
-                    self.save(false);
+                    self.save(false, &ctx);
                 }
                 if ui.button("Save as...").clicked() {
                     ui.close();
-                    self.save(true);
+                    self.save(true, &ctx);
                 }
                 ui.separator();
                 if ui.button("Export CSV...").clicked() {
                     ui.close();
-                    self.export_csv();
+                    self.start_dialog(PendingDialog::ExportCsv, &ctx);
                 }
             });
             ui.menu_button("Walls", |ui| {
@@ -1049,6 +1095,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_scans();
         let ctx = ui.ctx().clone();
+        self.poll_dialog(&ctx);
         self.refresh(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {
