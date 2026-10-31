@@ -20,6 +20,7 @@ enum Tool {
     Calibrate,
     Walls,
     DrawWall,
+    PlaceAp,
 }
 
 /// One row of the "what are these walls made of?" dialog.
@@ -90,6 +91,9 @@ pub struct App {
     metric: Metric,
     opacity: f32,
     show_points: bool,
+    show_aps: bool,
+    /// BSSID waiting to be placed with the next canvas click (Place AP tool).
+    placing_ap: Option<String>,
     show_zones: bool,
     show_walls: bool,
     selected_wall: Option<u32>,
@@ -150,6 +154,8 @@ impl App {
             metric: Metric::Signal,
             opacity: 0.85,
             show_points: true,
+            show_aps: true,
+            placing_ap: None,
             show_zones: true,
             show_walls: true,
             selected_wall: None,
@@ -645,6 +651,7 @@ impl App {
             }
             ui.selectable_value(&mut self.tool, Tool::Walls, "Select walls");
             ui.selectable_value(&mut self.tool, Tool::DrawWall, "Draw wall");
+            ui.selectable_value(&mut self.tool, Tool::PlaceAp, "Place AP");
             ui.separator();
             ui.label("Heatmap:");
             let before = self.metric.clone();
@@ -669,6 +676,7 @@ impl App {
             }
             ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).text("opacity"));
             ui.checkbox(&mut self.show_points, "points");
+            ui.checkbox(&mut self.show_aps, "APs");
             ui.checkbox(&mut self.show_zones, "dead zones");
         });
     }
@@ -810,8 +818,9 @@ impl App {
             ui.heading("Access points");
             let mut alias_edits: Vec<(String, String)> = Vec::new();
             let mut pick: Option<String> = None;
+            let mut place: Option<String> = None;
             egui::Grid::new("aps").striped(true).show(ui, |ui| {
-                for h in ["Name", "Ch", "Peak", "Mean", "n", ""] {
+                for h in ["Name", "Ch", "Peak", "Mean", "n", "", ""] {
                     ui.strong(h);
                 }
                 ui.end_row();
@@ -827,9 +836,32 @@ impl App {
                     if ui.small_button("map").on_hover_text(&ap.bssid).clicked() {
                         pick = Some(ap.bssid.clone());
                     }
+                    let placed = self.project.ap_position(&ap.bssid).is_some();
+                    let waiting = self.placing_ap.as_deref() == Some(ap.bssid.as_str());
+                    let label = if waiting { "click plan" } else if placed { "move" } else { "place" };
+                    if ui.small_button(label).on_hover_text("Then click the AP's spot on the floor plan").clicked() {
+                        place = Some(ap.bssid.clone());
+                    }
                     ui.end_row();
                 }
             });
+            if let Some(b) = place {
+                self.placing_ap = Some(b);
+                self.tool = Tool::PlaceAp;
+                self.status = "Click the AP's location on the floor plan (Esc cancels).".into();
+            }
+            if ui.button("Estimate unplaced APs from survey").on_hover_text("Rough guess from where each AP was heard strongest").clicked() {
+                let mut n = 0;
+                for ap in &self.analysis.aps {
+                    if self.project.ap_position(&ap.bssid).is_none() {
+                        if let Some(pos) = brainscan::analysis::estimate_ap_position(&self.project, &ap.bssid) {
+                            self.project.set_ap_position(&ap.bssid, pos);
+                            n += 1;
+                        }
+                    }
+                }
+                self.status = format!("Estimated {n} AP position(s). Use \"move\" to correct any.");
+            }
             for (bssid, name) in alias_edits {
                 if name.trim().is_empty() {
                     self.project.ap_aliases.remove(&bssid);
@@ -908,6 +940,7 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.draw_start = None;
             self.selected_wall = None;
+            self.placing_ap = None;
         }
         if self.show_walls {
             let highlight: &[u32] =
@@ -961,6 +994,30 @@ impl App {
             }
         }
 
+        if self.show_aps {
+            let mut hovered_ap: Option<String> = None;
+            for (bssid, &(x, y)) in &self.project.ap_positions {
+                let c = to_screen(x, y);
+                let near = resp.hover_pos().is_some_and(|m| m.distance(c) < 12.0);
+                if near {
+                    hovered_ap = Some(bssid.clone());
+                }
+                let r = if near { 9.0 } else { 7.0 };
+                let diamond = vec![c + Vec2::new(0.0, -r), c + Vec2::new(r, 0.0), c + Vec2::new(0.0, r), c + Vec2::new(-r, 0.0)];
+                clipped.add(egui::Shape::convex_polygon(diamond, Color32::from_rgb(20, 90, 220), Stroke::new(1.5, Color32::WHITE)));
+                let name = self.analysis.aps.iter().find(|a| &a.bssid == bssid).map_or_else(|| bssid.clone(), |a| format!("{} ch{}", a.name, a.channel));
+                let galley = painter.layout_no_wrap(name, egui::FontId::proportional(12.0), Color32::BLACK);
+                let pos = c + Vec2::new(r + 3.0, -galley.size().y / 2.0);
+                clipped.rect_filled(Rect::from_min_size(pos, galley.size()).expand(2.0), 2.0, Color32::from_white_alpha(210));
+                clipped.galley(pos, galley, Color32::BLACK);
+            }
+            if let Some(b) = hovered_ap {
+                if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+                    self.project.ap_positions.remove(&b);
+                }
+            }
+        }
+
         // Calibration overlay
         for &(x, y) in &self.cal_points {
             clipped.circle_filled(to_screen(x, y), 5.0, Color32::from_rgb(255, 200, 0));
@@ -1001,6 +1058,13 @@ impl App {
                                 self.selected_wall = Some(id);
                                 self.status = "Wall added. Click again to start another; Esc to stop.".into();
                             }
+                        },
+                        Tool::PlaceAp => match self.placing_ap.take() {
+                            Some(b) => {
+                                self.project.set_ap_position(&b, (x, y));
+                                self.status = "AP placed. Pick another AP's \"place\" button, or switch tools.".into();
+                            }
+                            None => self.status = "Choose an AP first: press \"place\" next to it in the Access points list.".into(),
                         },
                         Tool::Calibrate => {
                             self.cal_points.push((x, y));

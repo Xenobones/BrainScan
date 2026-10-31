@@ -163,6 +163,9 @@ pub struct Project {
     /// `None` means pick automatically from the plan size.
     #[serde(default)]
     pub interp_radius_m: Option<f64>,
+    /// BSSID (normalized) -> where the AP is on the floor plan (plan pixels, like survey points).
+    #[serde(default)]
+    pub ap_positions: BTreeMap<String, (f64, f64)>,
 }
 
 impl Project {
@@ -177,6 +180,7 @@ impl Project {
             units: Units::default(),
             walls: Vec::new(),
             interp_radius_m: None,
+            ap_positions: BTreeMap::new(),
         }
     }
 
@@ -202,6 +206,14 @@ impl Project {
 
     pub fn set_alias(&mut self, bssid: &str, alias: impl Into<String>) {
         self.ap_aliases.insert(normalize_bssid(bssid), alias.into());
+    }
+
+    pub fn set_ap_position(&mut self, bssid: &str, pos: (f64, f64)) {
+        self.ap_positions.insert(normalize_bssid(bssid), pos);
+    }
+
+    pub fn ap_position(&self, bssid: &str) -> Option<(f64, f64)> {
+        self.ap_positions.get(&normalize_bssid(bssid)).copied()
     }
 
     pub fn alias_for(&self, bssid: &str) -> Option<&str> {

@@ -274,6 +274,28 @@ pub fn suggest_channels(aps: &[ApSummary], band: Band, own_bssids: &[String], in
     scores
 }
 
+/// Guesses where an AP is: the average of the survey points that heard it strongest, weighted
+/// by received power in mW. Needs at least one reading; a rough guess that you can drag-correct
+/// by placing the AP by hand. Plan pixels.
+pub fn estimate_ap_position(project: &Project, bssid: &str) -> Option<(f64, f64)> {
+    let key = normalize_bssid(bssid);
+    let mut heard: Vec<(f64, f64, i32)> = project
+        .points
+        .iter()
+        .filter_map(|p| p.readings.iter().find(|r| normalize_bssid(&r.bssid) == key).map(|r| (p.x, p.y, r.rssi_dbm)))
+        .collect();
+    heard.sort_by_key(|h| std::cmp::Reverse(h.2));
+    heard.truncate(3);
+    let weights: Vec<f64> = heard.iter().map(|h| 10f64.powf(h.2 as f64 / 10.0)).collect();
+    let total: f64 = weights.iter().sum();
+    if heard.is_empty() || total <= 0.0 {
+        return None;
+    }
+    let x = heard.iter().zip(&weights).map(|(h, w)| h.0 * w).sum::<f64>() / total;
+    let y = heard.iter().zip(&weights).map(|(h, w)| h.1 * w).sum::<f64>() / total;
+    Some((x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +303,17 @@ mod tests {
 
     fn grid(cols: usize, rows: usize, vals: Vec<Option<f64>>) -> Grid {
         Grid { cols, rows, cell_px: 10.0, values: vals }
+    }
+
+    #[test]
+    fn estimate_leans_toward_the_strongest_readings() {
+        let mut p = Project::new("t");
+        let r = |dbm| ApReading { bssid: "aa:bb:cc:dd:ee:01".into(), ssid: "x".into(), rssi_dbm: dbm, channel: 1, band: Band::Ghz2_4 };
+        p.add_point(0.0, 0.0, vec![r(-40)]);
+        p.add_point(100.0, 0.0, vec![r(-70)]);
+        let (x, y) = estimate_ap_position(&p, "AA:BB:CC:DD:EE:01").unwrap();
+        assert!(x < 5.0 && y == 0.0, "x = {x}");
+        assert!(estimate_ap_position(&p, "11:22:33:44:55:66").is_none());
     }
 
     #[test]
